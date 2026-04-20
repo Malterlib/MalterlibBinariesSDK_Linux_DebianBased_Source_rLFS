@@ -1,0 +1,41 @@
+// Copyright © Unbroken AB
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// Import all roots
+Property
+{
+	MalterlibOnlyRepositoryManagement true
+	MalterlibInstallGitHookHelpers false
+}
+
+Import "Malterlib/Core/MalterlibRepoOnly.MOptionalHeader"
+
+Repository
+{
+	!!Repository.Type "Root"
+	
+	LfsReleaseStore true
+
+	License MalterlibRepoDefaultLicenseConfig
+	{
+		!!Repository.License undefined
+	}
+
+	CheckLicense true
+	{
+		!!Repository.CheckLicense undefined
+	}
+
+	MalterlibRepoReusePaths =+ [".gitattributes"]
+
+	License #<Include> [".gitattributes", ".gitignore", "Malterlib.*", "mib", "README.md", "Binaries/*", "Malterlib/*"]
+
+	License #<CommentStyles> =+ {
+		Path: ["mib"]
+		, LinePrefix: "# "
+		, DetectShebang: true
+	}
+
+	MalterlibRepoReusePaths =+ [
+	]
+}
