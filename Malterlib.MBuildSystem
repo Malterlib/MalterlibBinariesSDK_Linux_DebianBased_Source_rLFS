@@ -1,0 +1,18 @@
+// Copyright © Unbroken AB
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// Import all roots
+Property
+{
+	MalterlibOnlyRepositoryManagement true
+	MalterlibInstallGitHookHelpers false
+}
+
+Import "Malterlib/Core/MalterlibRepoOnly.MOptionalHeader"
+
+Repository
+{
+	!!Repository.Type "Root"
+	
+	LfsReleaseStore true
+}

@@ -1,0 +1,912 @@
+#!/bin/bash
+# Copyright © Unbroken AB
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+export MalterlibScriptPath="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export MalterlibBashSourceFull="$MalterlibScriptPath/${BASH_SOURCE[0]##*/}"
+
+set -eo pipefail
+
+cd "$MalterlibScriptPath"
+
+if [ -e .malterlib_only_repos ] && [[ "$MalterlibOnlyRepositoryManagement" == "" ]]; then
+	export MalterlibOnlyRepositoryManagement=true
+fi
+
+if [ -e Binaries/Malterlib/LICENSE.Malterlib ]; then
+	rm -rf Binaries/Malterlib
+fi
+
+if [ -e Malterlib/Core ]; then
+	find "$MalterlibScriptPath/Malterlib/Core" -maxdepth 0 -type d -empty -exec rmdir {} \;
+fi
+
+function OutputInfo()
+{
+	if [[ "$TERM" == "dumb" ]]; then
+		echo $'\e[1m\e[36m'"$@"$'\e[0m'
+	else
+		echo $'\e[38;5;39m'"$@"$'\e[0m'
+	fi
+}
+
+function OutputNote()
+{
+	if [[ "$TERM" == "dumb" ]]; then
+		echo $'\e[1m\e[33m'"$@"$'\e[0m'
+	else
+		echo $'\e[38;5;221m'"$@"$'\e[0m'
+	fi
+}
+
+function OutputHeading()
+{
+	if [[ "$TERM" == "dumb" ]]; then
+		echo $'\e[1m\e[32m'"$@"$'\e[0m'
+	else
+		echo $'\e[38;5;118m'"$@"$'\e[0m'
+	fi
+}
+
+function OutputError()
+{
+	if [[ "$TERM" == "dumb" ]]; then
+		echo $'\e[1m\e[31m'"$@"$'\e[0m'
+	else
+		echo $'\e[38;5;198m'"$@"$'\e[0m'
+	fi
+}
+
+BootstrapInit=false
+function BootstrapInit()
+{
+	if $BootstrapInit; then
+		return
+	fi
+
+	BootstrapInit=true
+
+	echo
+	OutputHeading '╭─────────────────────────╮'
+	OutputHeading '│ Bootstrapping Malterlib │'
+	OutputHeading '╰─────────────────────────╯'
+	echo
+
+	# Make sure that lfs is installed
+	if ! git lfs > /dev/null ; then
+		echo Please install git lfs
+		exit 1
+	fi
+
+	if ! cat ~/.gitconfig | grep 'filter "lfs"' > /dev/null ; then
+		git lfs install
+	fi
+
+	if [[ "$MalterlibPlatform" ==  Windows ]]; then
+		git config --global core.symlinks true
+	fi
+}
+
+function ReportBootstrapDone()
+{
+	if ! $BootstrapInit; then
+		return
+	fi
+
+	OutputHeading '╭─────────────────────────────────────╮'
+	OutputHeading '│ Successfully bootstrapped Malterlib │'
+	OutputHeading '╰─────────────────────────────────────╯'
+	echo
+}
+
+function IsWorktree()
+{
+	# Bootstrap worktree support only handles the default git layout where the
+	# worktree admin directory lives under <main>/.git/worktrees/<name>.
+	# Separate-git-dir and bare-backed worktrees intentionally fall back to the
+	# clone path below.
+	if [ -f "$MalterlibScriptPath/.git" ]; then
+		local GitDirContent
+		GitDirContent=$(cat "$MalterlibScriptPath/.git")
+		if [[ "$GitDirContent" == gitdir:*/.git/worktrees/* ]]; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
+function GetWorktreeMainRoot()
+{
+	if [ -f "$MalterlibScriptPath/.git" ]; then
+		local GitDir
+		GitDir=$(cat "$MalterlibScriptPath/.git" | sed 's/^gitdir: //')
+		# Resolve relative path
+		GitDir=$(cd "$MalterlibScriptPath" && cd "$GitDir" && pwd)
+		# Read commondir to find main .git
+		if [ -f "$GitDir/commondir" ]; then
+			local CommonDir
+			CommonDir=$(cat "$GitDir/commondir")
+			local MainGitDir
+			MainGitDir=$(cd "$GitDir" && cd "$CommonDir" && pwd)
+			# Main root is parent of .git directory
+			echo "$(dirname "$MainGitDir")"
+		else
+			# Fallback: parse path - gitdir is <main>/.git/worktrees/<name>
+			echo "$GitDir" | sed 's|/\.git/worktrees/.*$||'
+		fi
+	fi
+}
+
+function DetectRepoRoot()
+{
+	if [[ "$MalterlibRepoRoot" == "" ]]; then
+
+		OutputInfo "Determine MalterlibRepoRoot from *.MBuildSystem:"
+
+		MalterlibRepoRoot=https://github.com/Malterlib
+		BuildSystemContents=`cat *.MBuildSystem | grep MalterlibRepoRoot || true`
+
+		ToMatch='[ \t]*MalterlibRepoRoot[ \t]+(.*)'
+		while [[ $BuildSystemContents =~ $ToMatch ]]; do
+			BuildSystemContents=${BASH_REMATCH[1]}
+			break
+		done
+
+		ToMatch='^"(.*)"$'
+		while [[ $BuildSystemContents =~ $ToMatch ]]; do
+			BuildSystemContents=${BASH_REMATCH[1]}
+			break
+		done
+		if [[ "$BuildSystemContents" != "" ]]; then
+			MalterlibRepoRoot="$BuildSystemContents"
+			echo "Found customized MalterlibRepoRoot: `OutputNote "$MalterlibRepoRoot"`"
+		else
+			echo "Using default MalterlibRepoRoot: `OutputNote "$MalterlibRepoRoot"`"
+		fi
+
+		echo
+	fi
+}
+
+function GetMalterlibCoreHash()
+{
+	cat *.MRepo | grep -A2 '"Malterlib/Core"' | grep '"Hash":' | cut '-d ' -f 2 | tr -d '"' || true
+}
+
+function GetBranchFileValue()
+{
+	local BranchFile="$1"
+
+	if [ -e "$BranchFile" ]; then
+		local Branch
+		Branch=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$BranchFile")
+
+		if [[ "$Branch" != "" ]]; then
+			echo "$Branch"
+		fi
+	fi
+}
+
+function GetMainBranch()
+{
+	if [ -e "$MalterlibScriptPath/.git" ]; then
+		git -C "$MalterlibScriptPath" branch --show-current
+	else
+		local MainBranch
+		MainBranch=$(GetBranchFileValue "$MalterlibScriptPath/.malterlib-branch")
+
+		if [[ "$MainBranch" != "" ]]; then
+			echo "$MainBranch"
+			return
+		fi
+
+		echo master
+	fi
+}
+
+function GetDefaultLocalBranch()
+{
+	local RepoPath="$1"
+	local CurrentBranch
+	CurrentBranch=$(git -C "$RepoPath" branch --show-current 2>/dev/null || true)
+	# Best-effort local fallback when origin/HEAD is unavailable. Git does not
+	# store the authoritative default branch locally in the general case, so we
+	# only recognize the common main/master layouts here and otherwise leave the
+	# default branch unknown.
+
+	local HasMain=false
+	local HasMaster=false
+
+	if git -C "$RepoPath" rev-parse --verify refs/heads/main > /dev/null 2>&1; then
+		HasMain=true
+	fi
+
+	if git -C "$RepoPath" rev-parse --verify refs/heads/master > /dev/null 2>&1; then
+		HasMaster=true
+	fi
+
+	if [[ "$CurrentBranch" == "main" ]] && $HasMain; then
+		echo main
+		return
+	fi
+
+	if [[ "$CurrentBranch" == "master" ]] && $HasMaster; then
+		echo master
+		return
+	fi
+
+	if $HasMain && ! $HasMaster; then
+		echo main
+		return
+	fi
+
+	if $HasMaster && ! $HasMain; then
+		echo master
+		return
+	fi
+}
+
+function GetDefaultBranch()
+{
+	local RepoPath="$1"
+	local DefaultBranch
+	DefaultBranch=$(git -C "$RepoPath" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+	DefaultBranch="${DefaultBranch#origin/}"
+
+	if [[ "$DefaultBranch" == "" ]]; then
+		if git -C "$RepoPath" remote get-url origin > /dev/null 2>&1; then
+			git -C "$RepoPath" remote set-head origin --auto > /dev/null 2>&1 || true
+			DefaultBranch=$(git -C "$RepoPath" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+			DefaultBranch="${DefaultBranch#origin/}"
+		fi
+	fi
+
+	if [[ "$DefaultBranch" == "" ]]; then
+		GetDefaultLocalBranch "$RepoPath"
+		return
+	fi
+
+	echo "$DefaultBranch"
+}
+
+function GetMainDefaultBranch()
+{
+	if [ -e "$MalterlibScriptPath/.git" ]; then
+		GetDefaultBranch "$MalterlibScriptPath"
+	else
+		echo master
+	fi
+}
+
+function GetCoreDefaultBranch()
+{
+	local DefaultBranch
+	DefaultBranch=$(GetBranchFileValue "$MalterlibScriptPath/.malterlib-core-default-branch")
+
+	if [[ "$DefaultBranch" != "" ]]; then
+		echo "$DefaultBranch"
+		return
+	fi
+
+	echo master
+}
+
+function GetExpectedCoreBranch()
+{
+	local MainBranch
+	MainBranch=$(GetMainBranch)
+
+	if [[ "$MainBranch" == "" ]]; then
+		echo ""
+		return
+	fi
+
+	local MainDefaultBranch
+	# We must know whether the main repo is on its default branch before we can
+	# decide if Malterlib/Core should follow the main branch or use its own
+	# default branch. If the main default branch cannot be determined locally,
+	# treat the checkout as branch-specific and keep Malterlib/Core on the
+	# current branch instead of switching to its own default branch.
+	MainDefaultBranch=$(GetMainDefaultBranch)
+
+	if [[ "$MainDefaultBranch" != "" ]] && [[ "$MainBranch" == "$MainDefaultBranch" ]]; then
+		GetCoreDefaultBranch
+	else
+		echo "$MainBranch"
+	fi
+}
+
+function RequireMainBranch()
+{
+	local ErrorMessage="$1"
+	local MainBranch
+	MainBranch=$(GetMainBranch)
+
+	if [[ "$MainBranch" == "" ]]; then
+		OutputError "$ErrorMessage"
+		exit 1
+	fi
+}
+
+function EnsureCommitAvailable()
+{
+	local RepoPath="$1"
+	local GitHash="$2"
+
+	if ! git -C "$RepoPath" cat-file -e "${GitHash}^{commit}" 2>/dev/null; then
+		OutputInfo "Fetching $RepoPath to obtain commit $GitHash"
+		git -C "$RepoPath" fetch --all --tags
+	fi
+
+	if ! git -C "$RepoPath" cat-file -e "${GitHash}^{commit}" 2>/dev/null; then
+		OutputError "Could not find commit $GitHash in $RepoPath"
+		exit 1
+	fi
+}
+
+function TryGetBranchHash()
+{
+	local RepoPath="$1"
+	local Branch="$2"
+	local GitHash
+	GitHash=$(git -C "$RepoPath" rev-parse --verify "refs/remotes/origin/$Branch^{commit}" 2>/dev/null || true)
+
+	if [[ "$GitHash" == "" ]]; then
+		GitHash=$(git -C "$RepoPath" rev-parse --verify "refs/heads/$Branch^{commit}" 2>/dev/null || true)
+	fi
+
+	if [[ "$GitHash" == "" ]]; then
+		OutputInfo "Fetching $RepoPath to obtain branch '$Branch'"
+		git -C "$RepoPath" fetch --all --tags
+		GitHash=$(git -C "$RepoPath" rev-parse --verify "refs/remotes/origin/$Branch^{commit}" 2>/dev/null || true)
+
+		if [[ "$GitHash" == "" ]]; then
+			GitHash=$(git -C "$RepoPath" rev-parse --verify "refs/heads/$Branch^{commit}" 2>/dev/null || true)
+		fi
+	fi
+
+	if [[ "$GitHash" == "" ]]; then
+		return
+	fi
+
+	echo "$GitHash"
+}
+
+function GetBranchHash()
+{
+	local RepoPath="$1"
+	local Branch="$2"
+	local GitHash
+	GitHash=$(TryGetBranchHash "$RepoPath" "$Branch")
+
+	if [[ "$GitHash" == "" ]]; then
+		OutputError "Could not find branch '$Branch' in $RepoPath"
+		exit 1
+	fi
+
+	echo "$GitHash"
+}
+
+function PrepareBranchResetAtHash()
+{
+	local RepoPath="$1"
+	local Branch="$2"
+	local ExistingHash="$3"
+	local GitHash="$4"
+
+	if [[ "$ExistingHash" == "$GitHash" ]]; then
+		return
+	fi
+
+	if [[ "$MalterlibRepositoryHardReset" == "true" ]]; then
+		OutputInfo "Force resetting branch '$Branch' to $GitHash"
+		return
+	fi
+
+	# Bootstrap must not silently move an existing branch backwards. The
+	# normal repo-switching flow is handled by the C++ update-repos
+	# reconcile logic, but this shell path runs before that logic is
+	# available and therefore requires explicit destructive intent.
+	if git -C "$RepoPath" merge-base --is-ancestor "$ExistingHash" "$GitHash"; then
+		OutputInfo "Resetting branch '$Branch' to $GitHash"
+		return
+	fi
+
+	local ErrorMessage
+	ErrorMessage="Branch '$Branch' already exists in $RepoPath at $ExistingHash, expected $GitHash. Manual reconcile needed."
+	ErrorMessage+=$'\n'"   If you are ok with losing the commits in that branch, delete it and retry:"
+	ErrorMessage+=$'\n'"   git -C \"$RepoPath\" branch -D \"$Branch\" && \"$MalterlibScriptPath/mib\" update-repos"
+	OutputError "$ErrorMessage"
+	exit 1
+}
+
+function CheckoutBranchAtHash()
+{
+	local RepoPath="$1"
+	local Branch="$2"
+	local GitHash="$3"
+
+	if git -C "$RepoPath" rev-parse --verify "refs/heads/$Branch" > /dev/null 2>&1; then
+		local ExistingHash
+		ExistingHash=$(git -C "$RepoPath" rev-parse "$Branch")
+		PrepareBranchResetAtHash "$RepoPath" "$Branch" "$ExistingHash" "$GitHash"
+		git -C "$RepoPath" checkout -B "$Branch" "$GitHash"
+	else
+		git -C "$RepoPath" checkout -b "$Branch" "$GitHash"
+	fi
+}
+
+function AddWorktreeAtHash()
+{
+	local RepoPath="$1"
+	local Branch="$2"
+	local WorktreePath="$3"
+	local GitHash="$4"
+
+	if git -C "$RepoPath" rev-parse --verify "refs/heads/$Branch" > /dev/null 2>&1; then
+		local ExistingHash
+		ExistingHash=$(git -C "$RepoPath" rev-parse "$Branch")
+		PrepareBranchResetAtHash "$RepoPath" "$Branch" "$ExistingHash" "$GitHash"
+		git -C "$RepoPath" worktree add -B "$Branch" "$WorktreePath" "$GitHash"
+	else
+		git -C "$RepoPath" worktree add -b "$Branch" "$WorktreePath" "$GitHash"
+	fi
+}
+
+function ResolveCoreGitHash()
+{
+	local RepoPath="$1"
+	local GitHash="$2"
+
+	if [[ "$GitHash" == "" ]]; then
+		local ExpectedBranch
+		ExpectedBranch=$(GetExpectedCoreBranch)
+
+		if [[ "$ExpectedBranch" != "" ]]; then
+			GitHash=$(TryGetBranchHash "$RepoPath" "$ExpectedBranch")
+
+			if [[ "$GitHash" != "" ]]; then
+				OutputInfo "Could not find commit hash in *.MRepo files, using expected Malterlib/Core branch '$ExpectedBranch'"
+				echo "Using commit hash: `OutputNote "$GitHash"`"
+			fi
+		fi
+	fi
+
+	if [[ "$GitHash" == "" ]]; then
+		local CoreDefaultBranch
+		CoreDefaultBranch=$(GetCoreDefaultBranch)
+		GitHash=$(GetBranchHash "$RepoPath" "$CoreDefaultBranch")
+		OutputInfo "Could not find commit hash in *.MRepo files, using Malterlib/Core default branch '$CoreDefaultBranch'"
+		echo "Using commit hash: `OutputNote "$GitHash"`"
+	else
+		echo "Found commit hash in *.MRepo files: `OutputNote "$GitHash"`"
+	fi
+
+	ResolvedCoreGitHash="$GitHash"
+}
+
+function SyncCoreCheckoutAtHash()
+{
+	local RepoPath="$1"
+	local GitHash="$2"
+	local ExpectedBranch
+	ExpectedBranch=$(GetExpectedCoreBranch)
+
+	if [[ "$ExpectedBranch" == "" ]]; then
+		OutputError "Cannot bootstrap or upgrade Malterlib/Core: main repository is in detached HEAD state. Switch the main repository to a named branch and run ./mib update-repos."
+		exit 1
+	fi
+
+	EnsureCommitAvailable "$RepoPath" "$GitHash"
+
+	# Sub-repos are expected to stay in sync with the owning main branch
+	# outside worktrees as well. When the main repo is on its default
+	# branch, Malterlib/Core uses its own default branch instead, which can
+	# be overridden through .malterlib-core-default-branch.
+	CheckoutBranchAtHash "$RepoPath" "$ExpectedBranch" "$GitHash"
+}
+
+function AddCoreWorktreeAtHash()
+{
+	local MainSubRepo="$1"
+	local GitHash="$2"
+	local ExpectedBranch
+
+	OutputInfo "Adding Malterlib/Core as worktree from main working tree"
+
+	git -C "$MainSubRepo" worktree prune
+
+	ResolveCoreGitHash "$MainSubRepo" "$GitHash"
+	GitHash="$ResolvedCoreGitHash"
+	EnsureCommitAvailable "$MainSubRepo" "$GitHash"
+
+	ExpectedBranch=$(GetExpectedCoreBranch)
+
+	# Sub-repos are expected to stay in sync with their owning
+	# main/worktree branch. When the main repo is on its default branch,
+	# Malterlib/Core uses its own default branch instead, which can be
+	# overridden through .malterlib-core-default-branch. If this branch
+	# already exists in another Malterlib/Core worktree, that means the
+	# branch/worktree mapping is already inconsistent, and failing here is
+	# intentional.
+	AddWorktreeAtHash "$MainSubRepo" "$ExpectedBranch" "$MalterlibScriptPath/Malterlib/Core" "$GitHash"
+}
+
+function CloneAndSyncCoreCheckout()
+{
+	local GitHash="$1"
+
+	RequireMainBranch "Cannot bootstrap Malterlib/Core: main repository is in detached HEAD state"
+
+	OutputInfo "Cloning Malterlib/Core"
+	git clone -n "$MalterlibRepoRoot/Malterlib_Core.git" Malterlib/Core
+
+	ResolveCoreGitHash "Malterlib/Core" "$GitHash"
+	SyncCoreCheckoutAtHash "Malterlib/Core" "$ResolvedCoreGitHash"
+}
+
+MalterlibChangingBootstrapVersion="false"
+BootstrapVersion="5"
+MalterlibCoreBootstrapVersion="2"
+
+function DownloadPrivateGithubAsset
+{
+	GitHubApiToken=`printf "protocol=https\nhost=github.com\n" | git credential fill | grep password | cut -d = -f 2`
+
+	ApiRepoRoot="https://api.github.com/repos/Malterlib/$1"
+	AuthString="Authorization: token $GitHubApiToken"
+
+	echo "    $ApiRepoRoot"
+	curl -o /dev/null -sH "$AuthString" "$ApiRepoRoot" || { echo "Error: Invalid repo, token or network issue!";  exit 1; }
+
+	echo "    $ApiRepoRoot/releases/tags/$2"
+	TagResponse=$(curl -sH "$AuthString" "$ApiRepoRoot/releases/tags/$2")
+	eval $(echo "$TagResponse" | grep -C3 "name.:.\+$3" | grep -w id | tr : = | tr -cd '[[:alnum:]]=')
+
+	[ "$id" ] || { echo "Error: Failed to get asset id, response: $TagResponse" | awk 'length($0)<50' >&2; exit 1; }
+
+	echo "    $ApiRepoRoot/releases/assets/$id"
+	curl -LJo "$4" --no-progress-meter -H "Authorization: token $GitHubApiToken" -H 'Accept: application/octet-stream' "$ApiRepoRoot/releases/assets/$id"
+}
+
+function BootstrapCore()
+{
+	if ! [ -e Malterlib/Core ]; then
+		DetectRepoRoot
+
+		if ! [ -e Malterlib/Core ]; then
+
+			GitHash=`GetMalterlibCoreHash`
+
+			if IsWorktree; then
+				MainRoot=$(GetWorktreeMainRoot)
+				MainSubRepo="$MainRoot/Malterlib/Core"
+
+				if [ -e "$MainSubRepo/.git" ]; then
+					# Worktree bootstrap currently only supports named branches.
+					# Detached HEAD worktrees are intentionally rejected here because
+					# repository synchronization is branch-based and does not define a
+					# stable sub-repo branch to create/reuse for the new worktree.
+					# Get the branch name from the current worktree, not the main
+					RequireMainBranch "Cannot add Malterlib/Core worktree: main repository is in detached HEAD state"
+					AddCoreWorktreeAtHash "$MainSubRepo" "$GitHash"
+				else
+					CloneAndSyncCoreCheckout "$GitHash"
+				fi
+			else
+				CloneAndSyncCoreCheckout "$GitHash"
+			fi
+
+			echo
+		fi
+	fi
+
+	MalterlibCoreBootstrapVersion="2"
+
+	if [ -e "Malterlib/Core/Bootstrap.version" ]; then
+		MalterlibCoreBootstrapVersion=`cat "Malterlib/Core/Bootstrap.version"`
+	fi
+
+	if ! [ -e ./Malterlib/Core/Scripts/Detect.sh ] || [[ "$MalterlibCoreBootstrapVersion" != "$BootstrapVersion" ]]; then
+		# Upgrade path
+		export MalterlibChangingBootstrapVersion=true
+
+		git -C Malterlib/Core fetch --all --tags
+
+		GitHash=`GetMalterlibCoreHash`
+		ResolveCoreGitHash "Malterlib/Core" "$GitHash"
+		GitHash="$ResolvedCoreGitHash"
+
+		if [[ "$MalterlibRepositoryHardReset" == "true" ]] || (git -C Malterlib/Core branch -r --contains HEAD > /dev/null && [ -z "$(git -C Malterlib/Core status --porcelain || echo no)" ]); then
+			SyncCoreCheckoutAtHash "Malterlib/Core" "$GitHash"
+		else
+			OutputError "Malterlib/Core is not clean, please resolve the situation before trying to upgrade"
+			exit 1
+		fi
+	fi
+
+	unset MalterlibBinariesDir
+	source ./Malterlib/Core/Scripts/Detect.sh
+	if [[ "$MalterlibPlatform" ==  Windows ]]; then
+		mkdir -p /tmp
+	fi
+
+	MalterlibBinariesPath="Binaries/Malterlib/${MalterlibPlatform}/${MalterlibArch}"
+
+	if [ -e "$MalterlibScriptPath/$MalterlibBinariesPath" ]; then
+		find "$MalterlibScriptPath/$MalterlibBinariesPath" -maxdepth 0 -type d -empty -exec rmdir {} \;
+	fi
+
+	export MalterlibBootstrapBinariesPath="$HOME/.Malterlib/bootstrap/$BootstrapVersion"
+	if ! [ -e "$MalterlibBootstrapBinariesPath/Bootstrap.version" ]; then
+		if ! "$MalterlibExecutable" install-binaries &> /dev/null; then
+			BootstrapInit
+			DetectRepoRoot
+			export TempDir=`mktemp -d`
+			mkdir -p "$TempDir"
+
+			MalterlibBinariesRepo="MalterlibBinaries_${MalterlibPlatform}_${MalterlibArch}_rLFS"
+
+			PublicAssetUrl="$MalterlibRepoRoot/$MalterlibBinariesRepo/releases/download/bootstrap%2F${BootstrapVersion}/MTool.tar.gz"
+			echo "Trying public download"
+			echo "    $PublicAssetUrl"
+			ExpectedError="The requested URL returned error: 404"
+			if ! curl -L --no-progress-meter -fo "$TempDir/MTool.tar.gz" "$PublicAssetUrl" 2>&1 | grep -v "$ExpectedError"; then
+				echo Trying private download instead
+				DownloadPrivateGithubAsset "$MalterlibBinariesRepo" "bootstrap/${BootstrapVersion}" "MTool.tar.gz" "$TempDir/MTool.tar.gz"
+				echo
+			fi
+
+			mkdir -p "$MalterlibBootstrapBinariesPath"
+			pushd "$MalterlibBootstrapBinariesPath" > /dev/null
+				echo "$PWD:"
+				if [[ "$MalterlibPlatform" ==  "macOS" ]]; then
+					tar -xvf "$TempDir/MTool.tar.gz"
+				else
+					tar --force-local -xvf "$TempDir/MTool.tar.gz"
+				fi
+				./mib install-binaries
+			popd > /dev/null
+
+			echo
+
+			ReportBootstrapDone
+		fi
+	fi
+
+	if ! [ -e "$MalterlibScriptPath/$MalterlibBinariesPath/Bootstrap.version" ] || [[ `cat "$MalterlibScriptPath/$MalterlibBinariesPath/Bootstrap.version"` != "$BootstrapVersion" ]]; then
+		export MalterlibChangingBootstrapVersion=true
+	fi
+
+	if [[ "$MalterlibChangingBootstrapVersion" == "true" ]]; then
+		export Malterlib_UseCachedEnvironment=false
+		if [ -e "BuildSystem/Default/RepositoryState.json" ]; then
+			while read a; do
+			    echo ${a//\"\"\: 1\,/}
+			done < BuildSystem/Default/RepositoryState.json > BuildSystem/Default/RepositoryState.json.new
+			mv BuildSystem/Default/RepositoryState.json{.new,}
+		fi
+	fi
+}
+
+BootstrapCore
+
+export MalterlibBinariesPath
+
+ScriptsDir="$PWD/Malterlib/Core/Scripts"
+NumArguments=$#
+if (( $NumArguments >= 1 )); then
+	Command=$1
+	shift
+fi
+
+RetriedBootstrap="false"
+
+while true; do
+
+	function UpdateMTool()
+	{
+		unset MalterlibBinariesDir
+		if [[ "$PWD" != "$MalterlibScriptPath" ]]; then
+			echo "Current directory is incorrect: \"$PWD\" != \"$MalterlibScriptPath\""
+			exit 1
+		fi
+
+		MalterlibBinariesPath="Binaries/Malterlib/${MalterlibPlatform}/${MalterlibArch}"
+
+		if [[ "${MalterlibUseGlobalBinaries-}" == "true" ]]; then
+			MalterlibBinariesPath="$MalterlibBootstrapBinariesPath"
+			export MalterlibBinariesDir="$MalterlibBinariesPath"
+			source "$MalterlibScriptPath/Malterlib/Core/Scripts/Detect.sh"
+		elif ! [ -e "$MalterlibScriptPath/$MalterlibBinariesPath/Bootstrap.version" ] || [[ `cat "$MalterlibScriptPath/$MalterlibBinariesPath/Bootstrap.version"` != "$BootstrapVersion" ]]; then
+			MalterlibBinariesPath="$MalterlibBootstrapBinariesPath"
+			export MalterlibBinariesDir="$MalterlibBinariesPath"
+			source "$MalterlibScriptPath/Malterlib/Core/Scripts/Detect.sh"
+		elif [[ "$1" != "false" ]]; then
+			source "$MalterlibScriptPath/Malterlib/Core/Scripts/Detect.sh"
+		fi
+
+		UseSafeMib="$MalterlibSafeMib"
+		if [[ "$MalterlibPlatform" ==  Windows ]]; then
+			if [[ "${MalterlibUseGlobalBinaries-}" == "true" ]]; then
+				UseSafeMib="false"
+			else
+				UseSafeMib="true"
+			fi
+		fi
+
+		if [[ "$UseSafeMib" == "true" ]]; then
+			DependencyFile=BuildSystem/SafeMib/SafeMib.MalterlibDependency
+			SafeMibSourceFile=BuildSystem/SafeMib/SafeMib.source
+			SafeMibSourcePath="`MalterlibConvertPath \"$MalterlibBinariesPath\"`"
+
+			if ! [ -e "$SafeMibSourceFile" ] || [[ `cat "$SafeMibSourceFile"` != "$SafeMibSourcePath" ]]; then
+				rm -f "$DependencyFile"
+				rm -f BuildSystem/SafeMib/SafeMib.updated
+			fi
+
+			if [ -e "$DependencyFile" ]; then
+				"$MToolExecutable" CheckDependencies Verbose=true "Directory=BuildSystem/SafeMib"
+			fi
+
+			if ! [ -e BuildSystem/SafeMib/SafeMib.updated ]; then
+				echo Updating safe binaries
+
+				ExcludePatterns="*/.git;*/.DS_Store;*.TMP"
+
+				MalterlibDiffCopyExcludePatterns="$ExcludePatterns" "$MToolExecutable" DiffCopy "`MalterlibConvertPath \"$MalterlibBinariesPath\"`/*" "BuildSystem/SafeMib/Binaries" "" 1 1
+				MalterlibDiffCopyExcludePatterns="$ExcludePatterns" "$MToolExecutable" DiffCopy "Malterlib/Core/Scripts/*" "BuildSystem/SafeMib/Scripts" "" 1 1
+				echo "$SafeMibSourcePath" > "$SafeMibSourceFile"
+				"$MToolExecutable" TouchOrCreate "BuildSystem/SafeMib/SafeMib.updated"
+
+				if type MalterlibConvertPath > /dev/null; then
+					"$MToolExecutable" BuildDependencies "OutputFile=`MalterlibConvertPath \"$MalterlibScriptPath/$DependencyFile\"`" \
+					"Output:`MalterlibConvertPath \"$MalterlibScriptPath/BuildSystem/SafeMib/SafeMib.updated\"`" \
+					"Input:`MalterlibConvertPath \"$MalterlibBashSourceFull\"`" \
+					"Input:`MalterlibConvertPath \"$MalterlibScriptPath/$SafeMibSourceFile\"`" \
+					"Find:`MalterlibConvertPath \"$MalterlibBinariesPath\"`/*;RIF;33;$ExcludePatterns" \
+					"Find:`MalterlibConvertPath \"$MalterlibScriptPath/Malterlib/Core/Scripts\"`/*;RIF;33;$ExcludePatterns"
+				else
+					rm -f "$SafeMibSourceFile"
+					rm -f BuildSystem/SafeMib/SafeMib.updated
+				fi
+			fi
+
+			export MalterlibBinariesDir="$PWD/BuildSystem/SafeMib/Binaries"
+			ScriptsDir="$PWD/BuildSystem/SafeMib/Scripts"
+			source ./Malterlib/Core/Scripts/Detect.sh
+		fi
+	}
+
+	UpdateMTool false
+
+	export -f UpdateMTool
+
+	function RunTests()
+	{
+		Start=$SECONDS
+
+		function OutputTime()
+		{
+			OutputNote "$((SECONDS-Start)) s"
+			Start=$SECONDS
+			echo
+		}
+
+		OutputInfo '[Building]'
+		./mib build Tests
+		OutputTime
+
+		source BuildSystem/SharedBuildSettings.sh
+
+		OutputInfo '[Testing]'
+
+		if "$MalterlibDeployRoot/Tests/RunAllTests" "$@"; then
+			OutputTime
+			OutputHeading Success
+		else
+			OutputTime
+			OutputError "Tests FAILED"
+			exit 1
+		fi
+	}
+
+	case "$Command" in
+		generate)
+			MissingSetup=false
+			if [[ "$MalterlibPlatform" == macOS ]] ; then
+				if [ -e ./Malterlib/Core/Setup/macOS/setup.sh ]; then
+					./Malterlib/Core/Setup/macOS/setup.sh CheckSetup
+				else
+					MissingSetup=true
+				fi
+			fi
+
+			set +e
+
+			BootstrapVersion="$BootstrapVersion" "$ScriptsDir/mib.sh" generate "$@"
+
+			MToolExit=$?
+			set -e
+
+			if [[ "$MalterlibChangingBootstrapVersion" == "true" ]] && [[ "$RetriedBootstrap" == "false" ]]; then
+				if [[ $MToolExit > 0 ]]; then
+					RetriedBootstrap="true"
+					echo MTool potentially updated, running bootstrap again
+					BootstrapCore
+					continue
+				fi
+			fi
+
+			if [[ $MToolExit != 2 ]]; then
+				exit $MToolExit
+			fi
+
+			if $MissingSetup && [[ "$MalterlibPlatform" == macOS ]] && [ -e ./Malterlib/Core/Setup/macOS/setup.sh ]; then
+				./Malterlib/Core/Setup/macOS/setup.sh CheckSetup
+			fi
+		;;
+		setup_only)
+			# TODO: deprecate this
+			exit 0
+		;;
+		bootstrap-only)
+			exit 0
+		;;
+		bootstrap_only)
+			exit 0
+		;;
+		setup)
+			if [[ "$MalterlibPlatform" == macOS ]] ; then
+				./Malterlib/Core/Setup/macOS/setup.sh "$@"
+			fi
+		;;
+		build)
+			./Malterlib/Core/BuildScripts/BuildWorkspace.sh "$@"
+		;;
+		test)
+			RunTests "$@"
+		;;
+		build-target)
+			./Malterlib/Core/BuildScripts/BuildTarget.sh "$@"
+		;;
+		build_target)
+			./Malterlib/Core/BuildScripts/BuildTarget.sh "$@"
+		;;
+		prebuild)
+			./Malterlib/Core/BuildScripts/Prebuild.sh "$@"
+		;;
+		postbuild)
+			./Malterlib/Core/BuildScripts/Postbuild.sh "$@"
+		;;
+		detect-system)
+			source ./Malterlib/Core/BuildScripts/DetectSystem.sh "$@"
+		;;
+		detect_system)
+			source ./Malterlib/Core/BuildScripts/DetectSystem.sh "$@"
+		;;
+		*)
+			set +e
+			if (( $NumArguments >= 1 )); then
+				BootstrapVersion="$BootstrapVersion" "$ScriptsDir/mib.sh" "$Command" "$@"
+			else
+				BootstrapVersion="$BootstrapVersion" "$ScriptsDir/mib.sh" "$@"
+			fi
+			MToolExit=$?
+			set -e
+
+			if [[ "$MalterlibChangingBootstrapVersion" == "true" ]] && [[ "$RetriedBootstrap" == "false" ]]; then
+				if [[ $MToolExit > 0 ]]; then
+					RetriedBootstrap="true"
+					echo MTool potentially updated, running bootstrap again
+					BootstrapCore
+					continue
+				fi
+			fi
+
+			exit $MToolExit
+	esac
+
+	break
+
+done
