@@ -3,4 +3,7 @@
 *.tar.xz filter=lfs diff=lfs merge=lfs -text
 *.tar.bz2 filter=lfs diff=lfs merge=lfs -text
 *.diff.gz filter=lfs diff=lfs merge=lfs -text
+
+# Binary GPG signatures (most .asc are ASCII-armored, but this one is binary).
+/libgpg-error/1.43-3/libgpg-error_1.43.orig.tar.bz2.asc filter=lfs diff=lfs merge=lfs -text
 # END: Malterlib Linux SDK - Debian source tarballs tracked via Git LFS
